@@ -1,237 +1,186 @@
+// Example/example.ts
+import makeWASocket, {
+  AnyMessageContent,
+  DisconnectReason,
+  makeCacheableSignalKeyStore,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  jidNormalizedUser,
+  isJidNewsletter,
+  isJidBroadcast,
+  WAMessage,
+  Browsers,
+} from '../src' // se der erro aqui, troque para: from '@whiskeysockets/baileys'
+import NodeCache from 'node-cache'
+import pino from 'pino'
 import { Boom } from '@hapi/boom'
-import NodeCache from '@cacheable/node-cache'
-import qrcode from 'qrcode-terminal'
-import readline from 'readline'
-import makeWASocket, { CacheStore, DEFAULT_CONNECTION_CONFIG, DisconnectReason, fetchLatestBaileysVersion, generateMessageIDV2, getAggregateVotesInPollMessage, isJidNewsletter, makeCacheableSignalKeyStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
-import P from 'pino'
+import * as fs from 'fs'
+import * as path from 'path'
 
-const logger = P({
-  level: "trace",
-  transport: {
-    targets: [
-      {
-        target: "pino-pretty", // pretty-print for console
-        options: { colorize: true },
-        level: "trace",
-      },
-      {
-        target: "pino/file", // raw file output
-        options: { destination: './wa-logs.txt' },
-        level: "trace",
-      },
-    ],
-  },
+/**
+ * Ajuste aqui onde quer salvar a sessão (QR/credenciais)
+ */
+const AUTH_DIR = path.join(process.cwd(), 'baileys_auth_info')
+
+const logger = pino({
+  level: 'info', // troque para 'debug' se quiser mais logs
 })
-logger.level = 'trace'
 
-const doReplies = process.argv.includes('--do-reply')
-const usePairingCode = process.argv.includes('--use-pairing-code')
+function getTextFromMessage(msg: WAMessage): string {
+  const m = msg.message
+  if (!m) return ''
 
-// external map to store retry counts of messages when decryption/encryption fails
-// keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
-const msgRetryCounterCache = new NodeCache() as CacheStore
+  // texto simples
+  const conversation = (m as any).conversation
+  if (conversation) return conversation
 
-const onDemandMap = new Map<string, string>()
+  // texto em mensagem "extendida"
+  const extended = (m as any).extendedTextMessage?.text
+  if (extended) return extended
 
-// Read line interface
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve))
+  // legenda de imagem/vídeo/documento
+  const imageCaption = (m as any).imageMessage?.caption
+  if (imageCaption) return imageCaption
 
-// start a connection
-const startSock = async() => {
-	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
-	// NOTE: For unit testing purposes only
-	if (process.env.ADV_SECRET_KEY) {
-		state.creds.advSecretKey = process.env.ADV_SECRET_KEY
-	}
-	// fetch latest version of WA Web
-	const { version, isLatest } = await fetchLatestBaileysVersion()
-	logger.debug({version: version.join('.'), isLatest}, `using latest WA version`)
+  const videoCaption = (m as any).videoMessage?.caption
+  if (videoCaption) return videoCaption
 
-	const sock = makeWASocket({
-		version,
-		logger,
-		waWebSocketUrl: process.env.SOCKET_URL ?? DEFAULT_CONNECTION_CONFIG.waWebSocketUrl,
-		auth: {
-			creds: state.creds,
-			/** caching makes the store faster to send/recv messages */
-			keys: makeCacheableSignalKeyStore(state.keys, logger),
-		},
-		msgRetryCounterCache,
-		generateHighQualityLinkPreview: true,
-		// ignore all broadcast messages -- to receive the same
-		// comment the line below out
-		// shouldIgnoreJid: jid => isJidBroadcast(jid),
-		// implement to handle retries & poll updates
-		getMessage
-	})
+  const docCaption = (m as any).documentMessage?.caption
+  if (docCaption) return docCaption
 
-	// the process function lets you process all events that just occurred
-	// efficiently in a batch
-	sock.ev.process(
-		// events is a map for event name => event data
-		async(events) => {
-			// something about the connection changed
-			// maybe it closed, or we received all offline message or connection opened
-			if(events['connection.update']) {
-				const update = events['connection.update']
-				const { connection, lastDisconnect, qr } = update
-				if(connection === 'close') {
-					// reconnect if not logged out
-					if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
-						startSock()
-					} else {
-						logger.fatal('Connection closed. You are logged out.')
-					}
-				}
+  // botão/lista/respostas interativas (varia por versão)
+  const btn = (m as any).buttonsResponseMessage?.selectedDisplayText
+  if (btn) return btn
 
-				if (qr) {
-  qrcode.generate(qr, { small: true })
+  const list = (m as any).listResponseMessage?.title
+  if (list) return list
 
-  if (usePairingCode && !sock.authState.creds.registered) {
-    const phoneNumber = await question('Please enter your phone number:\n')
-    const code = await sock.requestPairingCode(phoneNumber)
-    console.log(`Pairing code: ${code}`)
-  }
+  return ''
 }
 
-				logger.debug(update, 'connection update')
-			}
+function getBestJid(msg: WAMessage): string {
+  // Alguns eventos vêm com remoteJidAlt preenchido (quando WA usa LID)
+  const key: any = msg.key || {}
+  return key.remoteJidAlt || key.remoteJid || ''
+}
 
-			// credentials updated -- save them
-			if(events['creds.update']) {
-				await saveCreds()
-				logger.debug({}, 'creds save triggered')
-			}
+async function start() {
+  // cache para retries
+  const msgRetryCounterCache = new NodeCache()
 
-			if(events['labels.association']) {
-				logger.debug(events['labels.association'], 'labels.association event fired')
-			}
+  // estado de auth
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
+  const { version, isLatest } = await fetchLatestBaileysVersion()
+  logger.info({ version, isLatest }, 'Using WA version')
 
-			if(events['labels.edit']) {
-				logger.debug(events['labels.edit'], 'labels.edit event fired')
-			}
+  const sock = makeWASocket({
+    version,
+    logger,
+    printQRInTerminal: true,
+    browser: Browsers.macOS('Chrome'),
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    msgRetryCounterCache,
+    syncFullHistory: false, // geralmente não precisa puxar histórico
+    generateHighQualityLinkPreview: false,
+  })
 
-			if(events['call']) {
-				logger.debug(events['call'], 'call event fired')
-			}
+  // sempre salvar creds quando mudar
+  sock.ev.on('creds.update', saveCreds)
 
-			// history received
-			if(events['messaging-history.set']) {
-				const { chats, contacts, messages, isLatest, progress, syncType } = events['messaging-history.set']
-				if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-					logger.debug(messages, 'received on-demand history sync')
-				}
-				logger.debug({contacts: contacts.length, chats: chats.length, messages: messages.length, isLatest, progress, syncType: syncType?.toString() }, 'messaging-history.set event fired')
-			}
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update
 
-			// received a new message
-      if (events['messages.upsert']) {
-        const upsert = events['messages.upsert']
-        logger.debug(upsert, 'messages.upsert fired')
+    if (connection === 'close') {
+      const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
 
-        if (!!upsert.requestId) {
-          logger.debug(upsert, 'placeholder request message received')
-        }
+      logger.warn(
+        { connection, statusCode, shouldReconnect },
+        'connection.update: close'
+      )
 
+      if (shouldReconnect) {
+        start().catch((e) => logger.error(e, 'reconnect failed'))
+      } else {
+        logger.error('Logged out. Apague a pasta de auth e conecte de novo.')
+      }
+    } else if (connection === 'open') {
+      logger.info('✅ Conectado! Agora só vou ESCUTAR mensagens (sem responder).')
+    } else if (connection === 'connecting') {
+      logger.info('⏳ Conectando...')
+    }
+  })
 
+  /**
+   * Escuta novas mensagens.
+   * IMPORTANTE: não responde nada!
+   */
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return
+    for (const msg of messages) {
+      if (!msg.message) continue
 
-        if (upsert.type === 'notify') {
-          for (const msg of upsert.messages) {
-            if (msg.message?.conversation || msg.message?.extendedTextMessage?.text) {
-              const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
-              if (text == "requestPlaceholder" && !upsert.requestId) {
-                const messageId = await sock.requestPlaceholderResend(msg.key)
-								logger.debug({ id: messageId }, 'requested placeholder resync')
-              }
+      const jid = getBestJid(msg)
+      if (!jid) continue
 
-              // go to an old chat and send this
-              if (text == "onDemandHistSync") {
-                const messageId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp!)
-                logger.debug({ id: messageId }, 'requested on-demand history resync')
-              }
+      // ignora broadcast/newsletter (opcional)
+      if (isJidBroadcast(jid) || isJidNewsletter(jid)) continue
 
-              if (!msg.key.fromMe && doReplies && !isJidNewsletter(msg.key?.remoteJid!)) {
-              	const id = generateMessageIDV2(sock.user?.id)
-              	logger.debug({id, orig_id: msg.key.id }, 'replying to message')
-                await sock.sendMessage(msg.key.remoteJid!, { text: 'pong '+msg.key.id }, {messageId: id })
-              }
-            }
-          }
-        }
+      const fromMe = !!msg.key?.fromMe
+      const pushName = (msg as any).pushName || ''
+      const text = getTextFromMessage(msg)
+      const id = msg.key?.id || ''
+      const ts = (msg as any).messageTimestamp
+
+      // Se quiser ignorar mensagens enviadas por você mesmo:
+      // if (fromMe) continue
+
+      if (text) {
+        console.log('\n----- NOVA MSG -----')
+        console.log('fromMe:', fromMe)
+        console.log('pushName:', pushName)
+        console.log('jid:', jid)
+        console.log('id:', id)
+        console.log('timestamp:', ts)
+        console.log('text:', text)
+      } else {
+        console.log('\n----- NOVA MSG (sem texto) -----')
+        console.log('fromMe:', fromMe)
+        console.log('pushName:', pushName)
+        console.log('jid:', jid)
+        console.log('id:', id)
+        console.log('timestamp:', ts)
+        console.log('tipo:', Object.keys(msg.message || {}))
       }
 
-			// messages updated like status delivered, message deleted etc.
-			if(events['messages.update']) {
-				logger.debug(events['messages.update'], 'messages.update fired')
+      /**
+       * ⚠️ NÃO enviar nada aqui.
+       * Quando você integrar na plataforma, você vai chamar:
+       * await sock.sendMessage(jid, { text: '...' })
+       */
+    }
+  })
 
-				for(const { key, update } of events['messages.update']) {
-					if(update.pollUpdates) {
-						const pollCreation: proto.IMessage = {} // get the poll creation message somehow
-						if(pollCreation) {
-							console.log(
-								'got poll update, aggregation: ',
-								getAggregateVotesInPollMessage({
-									message: pollCreation,
-									pollUpdates: update.pollUpdates,
-								})
-							)
-						}
-					}
-				}
-			}
+  /**
+   * Encerramento limpo
+   */
+  const shutdown = async () => {
+    try {
+      logger.info('Encerrando...')
+      await sock.logout()
+    } catch (e) {
+      // ignore
+    } finally {
+      process.exit(0)
+    }
+  }
 
-			if(events['message-receipt.update']) {
-				logger.debug(events['message-receipt.update'])
-			}
-
-			if (events['contacts.upsert']) {
-				logger.debug(events['message-receipt.update'])
-			}
-
-			if(events['messages.reaction']) {
-				logger.debug(events['messages.reaction'])
-			}
-
-			if(events['presence.update']) {
-				logger.debug(events['presence.update'])
-			}
-
-			if(events['chats.update']) {
-				logger.debug(events['chats.update'])
-			}
-
-			if(events['contacts.update']) {
-				for(const contact of events['contacts.update']) {
-					if(typeof contact.imgUrl !== 'undefined') {
-						const newUrl = contact.imgUrl === null
-							? null
-							: await sock!.profilePictureUrl(contact.id!).catch(() => null)
-						logger.debug({id: contact.id, newUrl}, `contact has a new profile pic` )
-					}
-				}
-			}
-
-			if(events['chats.delete']) {
-				logger.debug('chats deleted ', events['chats.delete'])
-			}
-
-			if(events['group.member-tag.update']) {
-				logger.debug('group member tag update', JSON.stringify(events['group.member-tag.update'], undefined, 2))
-			}
-		}
-	)
-
-	return sock
-
-	async function getMessage(key: WAMessageKey): Promise<WAMessageContent | undefined> {
-	  // Implement a way to retreive messages that were upserted from messages.upsert
-			// up to you
-
-		// only if store is present
-		return proto.Message.create({ conversation: 'test' })
-	}
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }
 
-startSock()
+start().catch((err) => logger.error(err, 'fatal error'))
