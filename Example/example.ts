@@ -1,5 +1,6 @@
 import { Boom } from '@hapi/boom'
 import NodeCache from '@cacheable/node-cache'
+import qrcode from 'qrcode-terminal'
 import readline from 'readline'
 import makeWASocket, { CacheStore, DEFAULT_CONNECTION_CONFIG, DisconnectReason, fetchLatestBaileysVersion, generateMessageIDV2, getAggregateVotesInPollMessage, isJidNewsletter, makeCacheableSignalKeyStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
 import P from 'pino'
@@ -85,13 +86,14 @@ const startSock = async() => {
 				}
 
 				if (qr) {
-					// Pairing code for Web clients
-					if (usePairingCode && !sock.authState.creds.registered) {
-						const phoneNumber = await question('Please enter your phone number:\n')
-						const code = await sock.requestPairingCode(phoneNumber)
-						console.log(`Pairing code: ${code}`)
-					}
-				}
+  qrcode.generate(qr, { small: true })
+
+  if (usePairingCode && !sock.authState.creds.registered) {
+    const phoneNumber = await question('Please enter your phone number:\n')
+    const code = await sock.requestPairingCode(phoneNumber)
+    console.log(`Pairing code: ${code}`)
+  }
+}
 
 				logger.debug(update, 'connection update')
 			}
