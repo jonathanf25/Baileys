@@ -173,7 +173,7 @@ async function start() {
 
     // ✅ 3) CONNECTING
     if (connection === "connecting") {
-      updateStatus("connecting")
+      updateStatus("connecting" as any)
       logger.info("⏳ Conectando...")
       // continua para possível pairing code
     }
@@ -185,7 +185,7 @@ async function start() {
         updateQR(qr)
       } else {
         // Se estiver em modo code, não precisamos expor QR
-        updateStatus("pairing_code")
+        updateStatus("pairing_code" as any)
         updateQR("")
       }
       // continua para possível pairing code
@@ -213,7 +213,7 @@ async function start() {
       pairingRequested = true
 
       try {
-        updateStatus("pairing_code")
+        updateStatus("pairing_code" as any)
         updateQR("")
 
         // Pequeno delay ajuda MUITO em VM (evita 428)
@@ -275,12 +275,16 @@ async function start() {
     }
   })
 
+  // ✅ SHUTDOWN ESTÁVEL: NÃO DESLOGA DO WHATSAPP
+  // Isso garante que deploy/restart não te derrube e não peça pareamento toda hora.
   const shutdown = async () => {
     try {
-      logger.info("Encerrando...")
-      await sock.logout()
-    } catch {
-      // ignore
+      logger.info("Encerrando (sem logout)...")
+      try {
+        await (sock as any)?.end?.()
+      } catch {
+        // ignore
+      }
     } finally {
       process.exit(0)
     }
