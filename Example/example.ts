@@ -14,6 +14,7 @@ import NodeCache from "node-cache"
 import pino from "pino"
 import { Boom } from "@hapi/boom"
 import * as path from "path"
+import axios from "axios"
 
 // ✅ servidor HTTP + status/qr + socket atual
 import { startServer, setSocket, updateStatus, updateQR } from "../server"
@@ -25,6 +26,11 @@ const __dirname = path.dirname(__filename)
 
 // pasta fixa: /Baileys/baileys_auth_info
 const AUTH_DIR = path.join(__dirname, "..", "baileys_auth_info")
+
+// ✅ Supabase ingest (Lovable)
+const SUPABASE_INGEST_URL =
+  "https://xfjwimdcbehviozfnpyz.supabase.co/functions/v1/wa-monitor-ingest"
+const SUPABASE_API_KEY = "baileys-monitor-2026"
 
 const logger = pino({ level: "info" })
 
@@ -236,6 +242,7 @@ async function start() {
 
   /**
    * ✅ Escuta mensagens, MAS NÃO RESPONDE NADA.
+   * ✅ Envia para Supabase (wa-monitor-ingest) para monitoramento.
    */
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return
@@ -255,6 +262,7 @@ async function start() {
       const tsRaw = (msg as any).messageTimestamp
       const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
+      // Logs (monitoramento local)
       if (text) {
         console.log("\n----- NOVA MSG -----")
         console.log("fromMe:", fromMe)
@@ -272,11 +280,37 @@ async function start() {
         console.log("timestamp:", ts)
         console.log("tipo:", Object.keys(msg.message || {}))
       }
+
+      // ✅ Envia para o Supabase ingest (Lovable espera esse formato)
+      try {
+        await axios.post(
+          SUPABASE_INGEST_URL,
+          {
+            event: "messages.upsert",
+            data: {
+              jid: jid,
+              sender_name: pushName,
+              message_id: id,
+              content: text || "",
+              timestamp: new Date(ts * 1000).toISOString(),
+            },
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": SUPABASE_API_KEY,
+            },
+          }
+        )
+
+        console.log("✅ Ingest enviado para Supabase:", id)
+      } catch (err: any) {
+        console.log("❌ Erro ao enviar ingest para Supabase:", err?.message || err)
+      }
     }
   })
 
   // ✅ SHUTDOWN ESTÁVEL: NÃO DESLOGA DO WHATSAPP
-  // Isso garante que deploy/restart não te derrube e não peça pareamento toda hora.
   const shutdown = async () => {
     try {
       logger.info("Encerrando (sem logout)...")
