@@ -1,4 +1,3 @@
-// Example/example.ts
 import makeWASocket, {
   DisconnectReason,
   makeCacheableSignalKeyStore,
@@ -8,24 +7,20 @@ import makeWASocket, {
   isJidBroadcast,
   WAMessage,
   Browsers,
-} from "../src" // se der erro aqui, troque para: from "@whiskeysockets/baileys"
+} from "@whiskeysockets/baileys"
 
 import NodeCache from "node-cache"
 import pino from "pino"
 import { Boom } from "@hapi/boom"
 import * as path from "path"
 
-// ✅ servidor HTTP + status/qr + socket atual
 import { startServer, setSocket, updateStatus, updateQR } from "../server"
 
 import { fileURLToPath } from "url"
 
-// ...
-
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-// pasta fixa: /Baileys/baileys_auth_info
 const AUTH_DIR = path.join(__dirname, "..", "baileys_auth_info")
 
 const logger = pino({ level: "info" })
@@ -82,7 +77,6 @@ async function start() {
   const sock = makeWASocket({
     version,
     logger,
-    printQRInTerminal: true,
     browser: Browsers.macOS("Chrome"),
     auth: {
       creds: state.creds,
@@ -92,19 +86,17 @@ async function start() {
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
   })
-// gerar código de pareamento (pairing code) se ainda não estiver registrado
-if (!state.creds.registered) {
-  const phoneNumber = "5535999428114" // exemplo: 5511999999999 
-  const code = await sock.requestPairingCode(phoneNumber)
-  logger.info({ code }, "PAIRING CODE")
-}
-  // ✅ sobe servidor HTTP uma vez
-  bootServerOnce()
 
-  // ✅ sempre aponta o servidor para o socket atual
+  // 🔹 GERAR PAIRING CODE
+  if (!state.creds.registered) {
+    const phoneNumber = "5535999428114"
+    const code = await sock.requestPairingCode(phoneNumber)
+    logger.info({ code }, "PAIRING CODE")
+  }
+
+  bootServerOnce()
   setSocket(sock)
 
-  // sempre salvar creds quando mudar
   sock.ev.on("creds.update", saveCreds)
 
   sock.ev.on("connection.update", async (update) => {
@@ -112,9 +104,9 @@ if (!state.creds.registered) {
 
     if (connection === "open") {
       updateStatus("connected")
-      updateQR("") // limpa QR
+      updateQR("")
       isReconnecting = false
-      logger.info("✅ Conectado! Agora só vou ESCUTAR mensagens (sem responder).")
+      logger.info("✅ Conectado!")
       return
     }
 
@@ -142,15 +134,13 @@ if (!state.creds.registered) {
         return
       }
 
-      // ✅ evita reconexões em cascata (start() chamando start() repetidamente)
       if (isReconnecting) {
-        logger.warn("Reconexão já em andamento, ignorando close duplicado.")
+        logger.warn("Reconexão já em andamento.")
         return
       }
 
       isReconnecting = true
 
-      // pequena pausa ajuda a estabilizar
       setTimeout(() => {
         start().catch((e) => {
           isReconnecting = false
@@ -162,9 +152,6 @@ if (!state.creds.registered) {
     }
   })
 
-  /**
-   * ✅ Escuta mensagens, MAS NÃO RESPONDE NADA.
-   */
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return
 
@@ -180,8 +167,6 @@ if (!state.creds.registered) {
       const pushName = (msg as any).pushName || ""
       const text = getTextFromMessage(msg)
       const id = msg.key?.id || ""
-      const tsRaw = (msg as any).messageTimestamp
-      const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
       if (text) {
         console.log("\n----- NOVA MSG -----")
@@ -189,16 +174,7 @@ if (!state.creds.registered) {
         console.log("pushName:", pushName)
         console.log("jid:", jid)
         console.log("id:", id)
-        console.log("timestamp:", ts)
         console.log("text:", text)
-      } else {
-        console.log("\n----- NOVA MSG (sem texto) -----")
-        console.log("fromMe:", fromMe)
-        console.log("pushName:", pushName)
-        console.log("jid:", jid)
-        console.log("id:", id)
-        console.log("timestamp:", ts)
-        console.log("tipo:", Object.keys(msg.message || {}))
       }
     }
   })
@@ -207,11 +183,9 @@ if (!state.creds.registered) {
     try {
       logger.info("Encerrando...")
       await sock.logout()
-    } catch {
-      // ignore
-    } finally {
-      process.exit(0)
-    }
+    } catch {}
+
+    process.exit(0)
   }
 
   process.on("SIGINT", shutdown)
