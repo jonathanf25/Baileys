@@ -1,44 +1,54 @@
 // Example/example.ts
 import makeWASocket, {
-  AnyMessageContent,
   DisconnectReason,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  jidNormalizedUser,
   isJidNewsletter,
   isJidBroadcast,
   WAMessage,
   Browsers,
-} from '../src' // se der erro aqui, troque para: from '@whiskeysockets/baileys'
-import NodeCache from 'node-cache'
-import pino from 'pino'
-import { Boom } from '@hapi/boom'
-import * as fs from 'fs'
-import * as path from 'path'
+} from "../src" // se der erro aqui, troque para: from "@whiskeysockets/baileys"
 
-/**
- * Ajuste aqui onde quer salvar a sessão (QR/credenciais)
- */
-const AUTH_DIR = path.join(process.cwd(), 'baileys_auth_info')
+import NodeCache from "node-cache"
+import pino from "pino"
+import { Boom } from "@hapi/boom"
+import * as path from "path"
 
-const logger = pino({
-  level: 'info', // troque para 'debug' se quiser mais logs
-})
+// ✅ servidor HTTP + status/qr + socket atual
+import { startServer, setSocket, updateStatus, updateQR } from "../server"
+
+import { fileURLToPath } from "url"
+
+// ...
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+// pasta fixa: /Baileys/baileys_auth_info
+const AUTH_DIR = path.join(__dirname, "..", "baileys_auth_info")
+
+const logger = pino({ level: "info" })
+
+let serverBooted = false
+let isReconnecting = false
+
+function bootServerOnce() {
+  if (serverBooted) return
+  serverBooted = true
+  startServer()
+}
 
 function getTextFromMessage(msg: WAMessage): string {
   const m = msg.message
-  if (!m) return ''
+  if (!m) return ""
 
-  // texto simples
   const conversation = (m as any).conversation
   if (conversation) return conversation
 
-  // texto em mensagem "extendida"
   const extended = (m as any).extendedTextMessage?.text
   if (extended) return extended
 
-  // legenda de imagem/vídeo/documento
   const imageCaption = (m as any).imageMessage?.caption
   if (imageCaption) return imageCaption
 
@@ -48,139 +58,159 @@ function getTextFromMessage(msg: WAMessage): string {
   const docCaption = (m as any).documentMessage?.caption
   if (docCaption) return docCaption
 
-  // botão/lista/respostas interativas (varia por versão)
   const btn = (m as any).buttonsResponseMessage?.selectedDisplayText
   if (btn) return btn
 
   const list = (m as any).listResponseMessage?.title
   if (list) return list
 
-  return ''
+  return ""
 }
 
 function getBestJid(msg: WAMessage): string {
-  // Alguns eventos vêm com remoteJidAlt preenchido (quando WA usa LID)
   const key: any = msg.key || {}
-  return key.remoteJidAlt || key.remoteJid || ''
+  return key.remoteJidAlt || key.remoteJid || ""
 }
 
 async function start() {
-  // cache para retries
   const msgRetryCounterCache = new NodeCache()
-
-  // estado de auth
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
   const { version, isLatest } = await fetchLatestBaileysVersion()
-  logger.info({ version, isLatest }, 'Using WA version')
+  logger.info({ version, isLatest }, "Using WA version")
 
   const sock = makeWASocket({
     version,
     logger,
     printQRInTerminal: true,
-    browser: Browsers.macOS('Chrome'),
+    browser: Browsers.macOS("Chrome"),
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     msgRetryCounterCache,
-    syncFullHistory: false, // geralmente não precisa puxar histórico
+    syncFullHistory: false,
     generateHighQualityLinkPreview: false,
   })
 
+  // ✅ sobe servidor HTTP uma vez
+  bootServerOnce()
+
+  // ✅ sempre aponta o servidor para o socket atual
+  setSocket(sock)
+
   // sempre salvar creds quando mudar
-  sock.ev.on('creds.update', saveCreds)
+  sock.ev.on("creds.update", saveCreds)
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update
 
-    if (connection === 'close') {
+    if (connection === "open") {
+      updateStatus("connected")
+      updateQR("") // limpa QR
+      isReconnecting = false
+      logger.info("✅ Conectado! Agora só vou ESCUTAR mensagens (sem responder).")
+      return
+    }
+
+    if (connection === "connecting") {
+      logger.info("⏳ Conectando...")
+      return
+    }
+
+    if (qr) {
+      updateStatus("awaiting_scan")
+      updateQR(qr)
+      return
+    }
+
+    if (connection === "close") {
+      updateStatus("disconnected")
+
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut
 
-      logger.warn(
-        { connection, statusCode, shouldReconnect },
-        'connection.update: close'
-      )
+      logger.warn({ connection, statusCode, shouldReconnect }, "connection.update: close")
 
-      if (shouldReconnect) {
-        start().catch((e) => logger.error(e, 'reconnect failed'))
-      } else {
-        logger.error('Logged out. Apague a pasta de auth e conecte de novo.')
+      if (!shouldReconnect) {
+        logger.error("Logged out. Apague a pasta de auth e conecte de novo.")
+        return
       }
-    } else if (connection === 'open') {
-      logger.info('✅ Conectado! Agora só vou ESCUTAR mensagens (sem responder).')
-    } else if (connection === 'connecting') {
-      logger.info('⏳ Conectando...')
+
+      // ✅ evita reconexões em cascata (start() chamando start() repetidamente)
+      if (isReconnecting) {
+        logger.warn("Reconexão já em andamento, ignorando close duplicado.")
+        return
+      }
+
+      isReconnecting = true
+
+      // pequena pausa ajuda a estabilizar
+      setTimeout(() => {
+        start().catch((e) => {
+          isReconnecting = false
+          logger.error(e, "reconnect failed")
+        })
+      }, 1200)
+
+      return
     }
   })
 
   /**
-   * Escuta novas mensagens.
-   * IMPORTANTE: não responde nada!
+   * ✅ Escuta mensagens, MAS NÃO RESPONDE NADA.
    */
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return
+
     for (const msg of messages) {
       if (!msg.message) continue
 
       const jid = getBestJid(msg)
       if (!jid) continue
 
-      // ignora broadcast/newsletter (opcional)
       if (isJidBroadcast(jid) || isJidNewsletter(jid)) continue
 
       const fromMe = !!msg.key?.fromMe
-      const pushName = (msg as any).pushName || ''
+      const pushName = (msg as any).pushName || ""
       const text = getTextFromMessage(msg)
-      const id = msg.key?.id || ''
-      const ts = (msg as any).messageTimestamp
-
-      // Se quiser ignorar mensagens enviadas por você mesmo:
-      // if (fromMe) continue
+      const id = msg.key?.id || ""
+      const tsRaw = (msg as any).messageTimestamp
+      const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
       if (text) {
-        console.log('\n----- NOVA MSG -----')
-        console.log('fromMe:', fromMe)
-        console.log('pushName:', pushName)
-        console.log('jid:', jid)
-        console.log('id:', id)
-        console.log('timestamp:', ts)
-        console.log('text:', text)
+        console.log("\n----- NOVA MSG -----")
+        console.log("fromMe:", fromMe)
+        console.log("pushName:", pushName)
+        console.log("jid:", jid)
+        console.log("id:", id)
+        console.log("timestamp:", ts)
+        console.log("text:", text)
       } else {
-        console.log('\n----- NOVA MSG (sem texto) -----')
-        console.log('fromMe:', fromMe)
-        console.log('pushName:', pushName)
-        console.log('jid:', jid)
-        console.log('id:', id)
-        console.log('timestamp:', ts)
-        console.log('tipo:', Object.keys(msg.message || {}))
+        console.log("\n----- NOVA MSG (sem texto) -----")
+        console.log("fromMe:", fromMe)
+        console.log("pushName:", pushName)
+        console.log("jid:", jid)
+        console.log("id:", id)
+        console.log("timestamp:", ts)
+        console.log("tipo:", Object.keys(msg.message || {}))
       }
-
-      /**
-       * ⚠️ NÃO enviar nada aqui.
-       * Quando você integrar na plataforma, você vai chamar:
-       * await sock.sendMessage(jid, { text: '...' })
-       */
     }
   })
 
-  /**
-   * Encerramento limpo
-   */
   const shutdown = async () => {
     try {
-      logger.info('Encerrando...')
+      logger.info("Encerrando...")
       await sock.logout()
-    } catch (e) {
+    } catch {
       // ignore
     } finally {
       process.exit(0)
     }
   }
 
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on("SIGINT", shutdown)
+  process.on("SIGTERM", shutdown)
 }
 
-start().catch((err) => logger.error(err, 'fatal error'))
+start().catch((err) => logger.error(err, "fatal error"))
