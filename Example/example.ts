@@ -8,6 +8,7 @@ import makeWASocket, {
   isJidBroadcast,
   WAMessage,
   Browsers,
+  downloadMediaMessage,
 } from "../src" // ✅ dentro do repo, use ../src
 
 import NodeCache from "node-cache"
@@ -16,10 +17,17 @@ import { Boom } from "@hapi/boom"
 import * as path from "path"
 import axios from "axios"
 
-// ✅ servidor HTTP + status/qr + socket atual
 import { startServer, setSocket, updateStatus, updateQR } from "../server"
-
 import { fileURLToPath } from "url"
+
+// ✅ para salvar/transcrever áudio na VM
+import * as fs from "fs/promises"
+import * as os from "os"
+import { randomUUID } from "crypto"
+import { execFile } from "child_process"
+import { promisify } from "util"
+
+const execFileAsync = promisify(execFile)
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -34,6 +42,17 @@ const SUPABASE_API_KEY = "baileys-monitor-2026"
 
 // ✅ Cache para não chamar groupMetadata toda mensagem
 const groupCache = new NodeCache({ stdTTL: 3600 }) // 1 hora
+
+// ✅ Config Whisper local (VM)
+const WHISPER_BIN_DEFAULT = path.join(os.homedir(), "whisper.cpp", "main")
+const WHISPER_MODEL_DEFAULT = path.join(os.homedir(), "whisper.cpp", "models", "ggml-small.bin")
+
+const WHISPER_BIN = process.env.WHISPER_BIN || WHISPER_BIN_DEFAULT
+const WHISPER_MODEL = process.env.WHISPER_MODEL || WHISPER_MODEL_DEFAULT
+const WHISPER_LANG = process.env.WHISPER_LANG || "pt"
+
+// ✅ evita travar o servidor transcrevendo muitos áudios ao mesmo tempo
+let audioQueue: Promise<void> = Promise.resolve()
 
 const logger = pino({ level: "info" })
 
@@ -91,6 +110,78 @@ function getBestJid(msg: WAMessage): string {
   return key.remoteJidAlt || key.remoteJid || ""
 }
 
+function isAudio(msg: WAMessage): boolean {
+  const m: any = msg.message || {}
+  return !!m.audioMessage
+}
+
+async function transcribeAudioBufferLocal(audioBuffer: Buffer): Promise<string | null> {
+  // ✅ escreve temporário
+  const tmpDir = os.tmpdir()
+  const id = randomUUID()
+
+  const inFile = path.join(tmpDir, `wa_audio_${id}.ogg`)
+  const wavFile = path.join(tmpDir, `wa_audio_${id}.wav`)
+  const outBase = path.join(tmpDir, `wa_audio_${id}_out`) // whisper gera outBase.txt
+
+  try {
+    await fs.writeFile(inFile, audioBuffer)
+
+    // ✅ converte para wav 16k mono (melhor para transcrição)
+    await execFileAsync("ffmpeg", ["-y", "-i", inFile, "-ar", "16000", "-ac", "1", wavFile])
+
+    // ✅ roda whisper.cpp e gera .txt
+    // flags comuns do whisper.cpp:
+    // -m modelo, -f arquivo wav, -l idioma, -otxt gera txt, -of base de saída
+    await execFileAsync(WHISPER_BIN, [
+      "-m",
+      WHISPER_MODEL,
+      "-f",
+      wavFile,
+      "-l",
+      WHISPER_LANG,
+      "-otxt",
+      "-of",
+      outBase,
+    ])
+
+    const txtFile = `${outBase}.txt`
+    const txt = await fs.readFile(txtFile, "utf-8")
+
+    const transcript = (txt || "").trim()
+    if (!transcript) return null
+
+    return transcript
+  } catch (e: any) {
+    console.log("❌ Falha transcrevendo áudio local:", e?.message || e)
+    return null
+  } finally {
+    // limpeza best-effort
+    try {
+      await fs.unlink(inFile)
+    } catch {}
+    try {
+      await fs.unlink(wavFile)
+    } catch {}
+    try {
+      await fs.unlink(`${outBase}.txt`)
+    } catch {}
+  }
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timeout ${ms}ms`)), ms)
+    p.then((v) => {
+      clearTimeout(t)
+      resolve(v)
+    }).catch((err) => {
+      clearTimeout(t)
+      reject(err)
+    })
+  })
+}
+
 async function start() {
   const msgRetryCounterCache = new NodeCache()
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
@@ -128,6 +219,9 @@ async function start() {
       registered: state.creds.registered,
       hasRequestPairingCode: typeof (sock as any).requestPairingCode,
       AUTH_DIR,
+      WHISPER_BIN,
+      WHISPER_MODEL,
+      WHISPER_LANG,
     },
     "BOOT CONFIG"
   )
@@ -234,7 +328,8 @@ async function start() {
   /**
    * ✅ Escuta mensagens, MAS NÃO RESPONDE NADA.
    * ✅ Envia para Supabase (wa-monitor-ingest) para monitoramento.
-   * ✅ Loga nome do grupo e número do remetente.
+   * ✅ Grupo: envia subject (nome do grupo).
+   * ✅ Áudio: transcreve local na VM e envia transcript.
    */
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return
@@ -248,6 +343,7 @@ async function start() {
       if (isJidBroadcast(jid) || isJidNewsletter(jid)) continue
 
       const isGroup = jid.endsWith("@g.us")
+      const isAudioMsg = isAudio(msg)
 
       const fromMe = !!msg.key?.fromMe
       const pushName = (msg as any).pushName || ""
@@ -257,8 +353,8 @@ async function start() {
       const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
       // ✅ Número de quem enviou
-      // - grupo: msg.key.participant -> "5535...@s.whatsapp.net"
-      // - 1-a-1: jid -> "5535...@s.whatsapp.net"
+      // - grupo: msg.key.participant -> "...@s.whatsapp.net" (às vezes pode vir LID)
+      // - 1-a-1: jid
       const participantJid = (msg.key as any)?.participant || ""
       const senderPhone = isGroup
         ? String(participantJid).split("@")[0].replace(/\D/g, "")
@@ -288,8 +384,57 @@ async function start() {
       console.log("senderPhone:", senderPhone || "(não encontrado)")
       console.log("id:", id)
       console.log("timestamp:", ts)
-      if (text) console.log("text:", text)
-      else console.log("tipo:", Object.keys(msg.message || {}))
+
+      if (isAudioMsg) {
+        console.log("messageType: audio")
+      } else if (text) {
+        console.log("messageType: text")
+        console.log("text:", text)
+      } else {
+        console.log("messageType: unknown")
+        console.log("tipo:", Object.keys(msg.message || {}))
+      }
+
+      // ✅ transcript (somente áudio)
+      let transcript: string | null = null
+
+      if (isAudioMsg) {
+        // enfileira para não travar CPU
+        audioQueue = audioQueue.then(async () => {
+          try {
+            console.log("🎧 Baixando áudio para transcrição...")
+
+            const media = (await downloadMediaMessage(
+              msg,
+              "buffer",
+              {},
+              {
+                logger,
+                reuploadRequest: sock.updateMediaMessage,
+              }
+            )) as Buffer
+
+            // timeout para não travar o fluxo
+            transcript = await withTimeout(transcribeAudioBufferLocal(media), 120000) // 120s
+
+            if (transcript) {
+              console.log("📝 Transcript (preview):", transcript.slice(0, 120))
+            } else {
+              console.log("📝 Transcript: (null)")
+            }
+          } catch (e: any) {
+            console.log("❌ Falha no fluxo de transcrição:", e?.message || e)
+            transcript = null
+          }
+        })
+
+        // espera a transcrição terminar antes de enviar ingest desta mensagem
+        try {
+          await audioQueue
+        } catch {
+          // ignore
+        }
+      }
 
       // ✅ Envia para o Supabase ingest (Lovable espera esse formato)
       try {
@@ -302,11 +447,18 @@ async function start() {
               sender_name: pushName,
               sender_phone: senderPhone, // ✅ obrigatório
               message_id: id,
-              content: text || "",
+
+              // ✅ Lovable: content separado / message_type separado
+              content: isAudioMsg ? "" : text || "",
+              message_type: isAudioMsg ? "audio" : "text",
+
               timestamp: new Date(ts * 1000).toISOString(),
 
-              // ✅ ADIÇÃO ÚNICA: manda o subject (nome do grupo) quando for grupo
+              // ✅ Grupo: subject (nome do grupo)
               ...(isGroup && groupName ? { subject: groupName } : {}),
+
+              // ✅ Áudio: transcript separado
+              ...(isAudioMsg ? { transcript: transcript } : {}),
             },
           },
           {
