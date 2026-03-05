@@ -7,7 +7,7 @@ import makeWASocket, {
   isJidBroadcast,
   WAMessage,
   Browsers,
-} from "@whiskeysockets/baileys"
+} from "../src"
 
 import NodeCache from "node-cache"
 import pino from "pino"
@@ -69,9 +69,11 @@ function getBestJid(msg: WAMessage): string {
 
 async function start() {
   const msgRetryCounterCache = new NodeCache()
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
   const { version, isLatest } = await fetchLatestBaileysVersion()
+
   logger.info({ version, isLatest }, "Using WA version")
 
   const sock = makeWASocket({
@@ -87,14 +89,37 @@ async function start() {
     generateHighQualityLinkPreview: false,
   })
 
-  // 🔹 GERAR PAIRING CODE
+  logger.info(
+    { registered: state.creds.registered },
+    "REGISTERED CHECK"
+  )
+
+  logger.info(
+    { hasRequestPairingCode: typeof (sock as any).requestPairingCode },
+    "PAIRING METHOD"
+  )
+
+  // Gera código de pareamento
   if (!state.creds.registered) {
-    const phoneNumber = "5535999428114"
-    const code = await sock.requestPairingCode(phoneNumber)
-    logger.info({ code }, "PAIRING CODE")
+    try {
+      const phoneNumber = "5535999428114"
+
+      logger.info({ phoneNumber }, "REQUESTING PAIRING CODE")
+
+      const code = await (sock as any).requestPairingCode(phoneNumber)
+
+      logger.info({ code }, "PAIRING CODE")
+
+      logger.info(
+        "No celular: WhatsApp > Dispositivos conectados > Conectar dispositivo > Conectar com número/código"
+      )
+    } catch (e) {
+      logger.error(e, "PAIRING CODE FAILED")
+    }
   }
 
   bootServerOnce()
+
   setSocket(sock)
 
   sock.ev.on("creds.update", saveCreds)
@@ -106,7 +131,9 @@ async function start() {
       updateStatus("connected")
       updateQR("")
       isReconnecting = false
+
       logger.info("✅ Conectado!")
+
       return
     }
 
@@ -124,13 +151,20 @@ async function start() {
     if (connection === "close") {
       updateStatus("disconnected")
 
-      const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
+      const statusCode =
+        (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
+
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut
 
-      logger.warn({ connection, statusCode, shouldReconnect }, "connection.update: close")
+      logger.warn(
+        { connection, statusCode, shouldReconnect },
+        "connection.update: close"
+      )
 
       if (!shouldReconnect) {
-        logger.error("Logged out. Apague a pasta de auth e conecte de novo.")
+        logger.error(
+          "Logged out. Apague a pasta de auth e conecte novamente."
+        )
         return
       }
 
