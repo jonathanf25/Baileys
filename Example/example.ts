@@ -92,7 +92,12 @@ async function start() {
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
   })
-
+// gerar código de pareamento (pairing code) se ainda não estiver registrado
+if (!state.creds.registered) {
+  const phoneNumber = "5535999428114" // exemplo: 5511999999999 
+  const code = await sock.requestPairingCode(phoneNumber)
+  logger.info({ code }, "PAIRING CODE")
+}
   // ✅ sobe servidor HTTP uma vez
   bootServerOnce()
 
