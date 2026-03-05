@@ -257,6 +257,8 @@ async function start() {
       const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
       // ✅ Número de quem enviou
+      // - grupo: msg.key.participant -> "5535...@s.whatsapp.net"
+      // - 1-a-1: jid -> "5535...@s.whatsapp.net"
       const participantJid = (msg.key as any)?.participant || ""
       const senderPhone = isGroup
         ? String(participantJid).split("@")[0].replace(/\D/g, "")
@@ -303,7 +305,7 @@ async function start() {
               content: text || "",
               timestamp: new Date(ts * 1000).toISOString(),
 
-              // ✅ NOVO: envia subject do grupo (edge function aceita body.subject)
+              // ✅ ADIÇÃO ÚNICA: manda o subject (nome do grupo) quando for grupo
               ...(isGroup && groupName ? { subject: groupName } : {}),
             },
           },
