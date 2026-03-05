@@ -204,7 +204,9 @@ async function start() {
       if (!inFlow) return
 
       if (!PAIR_PHONE) {
-        logger.error("PAIR_MODE=code mas PAIR_PHONE não foi informado. Ex: PAIR_PHONE=5535999428114")
+        logger.error(
+          "PAIR_MODE=code mas PAIR_PHONE não foi informado. Ex: PAIR_PHONE=5535999428114"
+        )
         return
       }
 
@@ -255,8 +257,6 @@ async function start() {
       const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
       // ✅ Número de quem enviou
-      // - grupo: msg.key.participant -> "5535...@s.whatsapp.net"
-      // - 1-a-1: jid -> "5535...@s.whatsapp.net"
       const participantJid = (msg.key as any)?.participant || ""
       const senderPhone = isGroup
         ? String(participantJid).split("@")[0].replace(/\D/g, "")
@@ -302,6 +302,9 @@ async function start() {
               message_id: id,
               content: text || "",
               timestamp: new Date(ts * 1000).toISOString(),
+
+              // ✅ NOVO: envia subject do grupo (edge function aceita body.subject)
+              ...(isGroup && groupName ? { subject: groupName } : {}),
             },
           },
           {
