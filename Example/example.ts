@@ -32,6 +32,9 @@ const SUPABASE_INGEST_URL =
   "https://xfjwimdcbehviozfnpyz.supabase.co/functions/v1/wa-monitor-ingest"
 const SUPABASE_API_KEY = "baileys-monitor-2026"
 
+// ✅ Cache para não chamar groupMetadata toda mensagem
+const groupCache = new NodeCache({ stdTTL: 3600 }) // 1 hora
+
 const logger = pino({ level: "info" })
 
 let serverBooted = false
@@ -101,11 +104,7 @@ async function start() {
     version,
     logger,
 
-    // ⚠️ printQRInTerminal foi deprecated; vamos usar connection.update -> qr
-    // printQRInTerminal: true,
-
     // Browser fingerprint: às vezes Windows ajuda em VM
-    // browser: Browsers.macOS("Chrome"),
     browser: ["Windows", "Chrome", "123.0"] as any,
 
     auth: {
@@ -146,7 +145,7 @@ async function start() {
       return
     }
 
-    // ✅ 2) CLOSE (antes do QR, para não engolir reconexão)
+    // ✅ 2) CLOSE
     if (connection === "close") {
       updateStatus("disconnected")
 
@@ -181,7 +180,6 @@ async function start() {
     if (connection === "connecting") {
       updateStatus("connecting" as any)
       logger.info("⏳ Conectando...")
-      // continua para possível pairing code
     }
 
     // ✅ 4) QR (somente se modo QR)
@@ -190,29 +188,23 @@ async function start() {
         updateStatus("awaiting_scan")
         updateQR(qr)
       } else {
-        // Se estiver em modo code, não precisamos expor QR
         updateStatus("pairing_code" as any)
         updateQR("")
       }
-      // continua para possível pairing code
     }
 
     // ✅ 5) PAIRING CODE (somente se modo CODE e ainda não registrado)
-    // Chamamos aqui (no connection.update) para evitar 428 "Connection Closed" por chamar cedo demais.
     if (
       PAIR_MODE === "code" &&
       !state.creds.registered &&
       !pairingRequested &&
       typeof (sock as any).requestPairingCode === "function"
     ) {
-      // Só tenta quando já entrou no fluxo de conexão (connecting ou qr recebido)
       const inFlow = connection === "connecting" || !!qr
       if (!inFlow) return
 
       if (!PAIR_PHONE) {
-        logger.error(
-          "PAIR_MODE=code mas PAIR_PHONE não foi informado. Ex: PAIR_PHONE=5535999428114"
-        )
+        logger.error("PAIR_MODE=code mas PAIR_PHONE não foi informado. Ex: PAIR_PHONE=5535999428114")
         return
       }
 
@@ -221,8 +213,6 @@ async function start() {
       try {
         updateStatus("pairing_code" as any)
         updateQR("")
-
-        // Pequeno delay ajuda MUITO em VM (evita 428)
         await sleep(1200)
 
         logger.info({ phone: PAIR_PHONE }, "REQUESTING PAIRING CODE...")
@@ -233,7 +223,6 @@ async function start() {
           "No celular: WhatsApp > Dispositivos conectados > Conectar dispositivo > Conectar com número/código"
         )
       } catch (e) {
-        // Permite tentar novamente após reconectar
         pairingRequested = false
         logger.error(e, "PAIRING CODE FAILED")
       }
@@ -243,6 +232,7 @@ async function start() {
   /**
    * ✅ Escuta mensagens, MAS NÃO RESPONDE NADA.
    * ✅ Envia para Supabase (wa-monitor-ingest) para monitoramento.
+   * ✅ Loga nome do grupo e número do remetente.
    */
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return
@@ -255,6 +245,8 @@ async function start() {
 
       if (isJidBroadcast(jid) || isJidNewsletter(jid)) continue
 
+      const isGroup = jid.endsWith("@g.us")
+
       const fromMe = !!msg.key?.fromMe
       const pushName = (msg as any).pushName || ""
       const text = getTextFromMessage(msg)
@@ -262,24 +254,40 @@ async function start() {
       const tsRaw = (msg as any).messageTimestamp
       const ts = typeof tsRaw === "number" ? tsRaw : Number(tsRaw)
 
-      // Logs (monitoramento local)
-      if (text) {
-        console.log("\n----- NOVA MSG -----")
-        console.log("fromMe:", fromMe)
-        console.log("pushName:", pushName)
-        console.log("jid:", jid)
-        console.log("id:", id)
-        console.log("timestamp:", ts)
-        console.log("text:", text)
-      } else {
-        console.log("\n----- NOVA MSG (sem texto) -----")
-        console.log("fromMe:", fromMe)
-        console.log("pushName:", pushName)
-        console.log("jid:", jid)
-        console.log("id:", id)
-        console.log("timestamp:", ts)
-        console.log("tipo:", Object.keys(msg.message || {}))
+      // ✅ Número de quem enviou
+      // - grupo: msg.key.participant -> "5535...@s.whatsapp.net"
+      // - 1-a-1: jid -> "5535...@s.whatsapp.net"
+      const participantJid = (msg.key as any)?.participant || ""
+      const senderPhone = isGroup
+        ? String(participantJid).split("@")[0].replace(/\D/g, "")
+        : String(jid).split("@")[0].replace(/\D/g, "")
+
+      // ✅ Nome do grupo (com cache)
+      let groupName = ""
+      if (isGroup) {
+        groupName = (groupCache.get(jid) as string) || ""
+        if (!groupName) {
+          try {
+            const meta = await sock.groupMetadata(jid)
+            groupName = meta?.subject || ""
+            if (groupName) groupCache.set(jid, groupName)
+          } catch {
+            groupName = ""
+          }
+        }
       }
+
+      // Logs (monitoramento local)
+      console.log("\n----- NOVA MSG -----")
+      console.log("fromMe:", fromMe)
+      console.log("pushName:", pushName)
+      console.log("jid:", jid)
+      if (isGroup) console.log("groupName:", groupName || "(sem nome ainda)")
+      console.log("senderPhone:", senderPhone || "(não encontrado)")
+      console.log("id:", id)
+      console.log("timestamp:", ts)
+      if (text) console.log("text:", text)
+      else console.log("tipo:", Object.keys(msg.message || {}))
 
       // ✅ Envia para o Supabase ingest (Lovable espera esse formato)
       try {
@@ -290,6 +298,7 @@ async function start() {
             data: {
               jid: jid,
               sender_name: pushName,
+              sender_phone: senderPhone, // ✅ obrigatório
               message_id: id,
               content: text || "",
               timestamp: new Date(ts * 1000).toISOString(),
@@ -304,11 +313,11 @@ async function start() {
         )
 
         console.log("✅ Ingest enviado para Supabase:", id)
-     } catch (err: any) {
-  console.log("❌ Erro ao enviar ingest para Supabase:", err?.message || err)
-  console.log("➡️ Status:", err?.response?.status)
-  console.log("➡️ Data:", err?.response?.data)
-}
+      } catch (err: any) {
+        console.log("❌ Erro ao enviar ingest para Supabase:", err?.message || err)
+        console.log("➡️ Status:", err?.response?.status)
+        console.log("➡️ Data:", err?.response?.data)
+      }
     }
   })
 
