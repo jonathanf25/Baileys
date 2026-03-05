@@ -1,17 +1,11 @@
-// server.ts — Ajustado para o contrato do Lovable
-// ✅ Mantém WhatsApp como MONITORAMENTO (nenhuma resposta automática aqui)
-// ✅ Expõe: GET /status, GET /qr, POST /send
-// ✅ Mantém: GET /health e POST /send-message (compatibilidade)
-
+// server.ts — contrato Lovable + endpoint de grupos
 import express from "express"
 import cors from "cors"
 
 let serverStarted = false
 let currentSock: any = null
 
-// Incluí "connecting" porque você já viu esse status no /status.
-// Isso evita inconsistência e erro de tipagem.
-export type ConnStatus = "connected" | "disconnected" | "awaiting_scan" | "connecting"
+export type ConnStatus = "connected" | "disconnected" | "awaiting_scan" | "connecting" | "pairing_code"
 let connectionStatus: ConnStatus = "disconnected"
 let qrCode = ""
 
@@ -19,7 +13,6 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// Funções chamadas pelo Baileys (em outro arquivo)
 export function updateStatus(status: ConnStatus) {
   connectionStatus = status
 }
@@ -32,24 +25,54 @@ export function setSocket(sock: any) {
   currentSock = sock
 }
 
-// Rotas
+// ✅ Rotas base
 app.get("/health", (_req, res) => res.send("ok"))
 
 app.get("/status", (_req, res) => {
   res.json({ status: connectionStatus })
 })
 
-// Contrato Lovable: GET /qr -> { "qr_code": "..." }
-// Se não tiver QR, retorna null (mais claro para o frontend).
-// (Opcional) também retorna "qr" para compatibilidade com versões antigas.
 app.get("/qr", (_req, res) => {
-  const value = qrCode?.trim() ? qrCode : null
-  return res.json({ qr_code: value, qr: value })
+  res.json({ qr_code: qrCode })
 })
 
-// Contrato Lovable: POST /send
-// Body: { "jid": "5511...@s.whatsapp.net", "text": "mensagem" }
-// Resp: { "success": true, "messageId": "..." }
+// ✅ NOVO: endpoint para o Lovable buscar nome real do grupo
+// GET /groups/:jid  -> { subject: "Nome do Grupo" }
+app.get("/groups/:jid", async (req, res) => {
+  try {
+    const jidParam = String(req.params.jid || "").trim()
+
+    if (!jidParam) {
+      return res.status(400).json({ error: "jid obrigatório" })
+    }
+
+    // o Lovable pode mandar URL-encoded
+    const jid = decodeURIComponent(jidParam)
+
+    if (!jid.endsWith("@g.us")) {
+      return res.status(400).json({ error: "jid não parece ser grupo (@g.us)" })
+    }
+
+    if (connectionStatus !== "connected") {
+      return res.status(503).json({
+        error: `whatsapp não está conectado (status=${connectionStatus})`,
+      })
+    }
+
+    if (!currentSock || typeof currentSock.groupMetadata !== "function") {
+      return res.status(503).json({ error: "socket ainda não está pronto" })
+    }
+
+    const meta = await currentSock.groupMetadata(jid)
+    const subject = meta?.subject || ""
+
+    return res.json({ subject })
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || "erro ao buscar grupo" })
+  }
+})
+
+// ✅ Contrato Lovable: POST /send
 app.post("/send", async (req, res) => {
   try {
     const { jid, text } = req.body ?? {}
@@ -61,7 +84,6 @@ app.post("/send", async (req, res) => {
       })
     }
 
-    // Evita tentar enviar quando a sessão não está pronta
     if (connectionStatus !== "connected") {
       return res.status(503).json({
         success: false,
@@ -77,11 +99,7 @@ app.post("/send", async (req, res) => {
     }
 
     const msg = await currentSock.sendMessage(jid, { text })
-
-    return res.json({
-      success: true,
-      messageId: msg?.key?.id,
-    })
+    return res.json({ success: true, messageId: msg?.key?.id })
   } catch (e: any) {
     return res.status(500).json({
       success: false,
@@ -90,7 +108,7 @@ app.post("/send", async (req, res) => {
   }
 })
 
-// Compatibilidade (rota antiga)
+// (Opcional) compatibilidade antiga
 app.post("/send-message", async (req, res) => {
   try {
     const { jid, text } = req.body ?? {}
@@ -117,11 +135,7 @@ app.post("/send-message", async (req, res) => {
     }
 
     const msg = await currentSock.sendMessage(jid, { text })
-
-    return res.json({
-      success: true,
-      messageId: msg?.key?.id,
-    })
+    return res.json({ success: true, messageId: msg?.key?.id })
   } catch (e: any) {
     return res.status(500).json({
       success: false,
