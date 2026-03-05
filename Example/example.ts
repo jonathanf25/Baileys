@@ -304,9 +304,11 @@ async function start() {
         )
 
         console.log("✅ Ingest enviado para Supabase:", id)
-      } catch (err: any) {
-        console.log("❌ Erro ao enviar ingest para Supabase:", err?.message || err)
-      }
+     } catch (err: any) {
+  console.log("❌ Erro ao enviar ingest para Supabase:", err?.message || err)
+  console.log("➡️ Status:", err?.response?.status)
+  console.log("➡️ Data:", err?.response?.data)
+}
     }
   })
 
